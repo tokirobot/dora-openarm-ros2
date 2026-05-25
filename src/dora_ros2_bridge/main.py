@@ -17,39 +17,23 @@
 This node acts as a state holder and message translator between the Dora dataflow
 and ROS 2 control interfaces. It subscribes to joint position and camera inputs
 from the Dora graph and forwards them to the appropriate ROS 2 controllers.
-
-Current use cases:
-  - Teleoperation: relay joint commands from a leader to the robot controllers
-  - Data collection: forward states for rosbag recording
-
-This bridge will be updated as teleoperation and data collection requirements evolve.
-
-Inputs (Dora):
-  - position_left  : float32[8] - left arm joints (7) + gripper (1)
-  - position_right : float32[8] - right arm joints (7) + gripper (1)
-  - image          : uint8[]    - JPEG-encoded image
-
-Outputs (ROS 2):
-  - /left_joint_trajectory_controller/joint_trajectory
-  - /right_joint_trajectory_controller/joint_trajectory
-  - /left_gripper_controller/joint_trajectory
-  - /right_gripper_controller/joint_trajectory
-  - /camera/image/compressed
 """
 
+import time
+
 import dora
+import numpy as np
 import pyarrow as pa
 
 
-def main():
-    """Run the Dora-to-ROS 2 bridge."""
+def main() -> None:
+    """Run the Dora-to-ROS2 bridge node."""
     # --- 1. ROS 2 Setup ---
     context = dora.Ros2Context()
     options = dora.Ros2NodeOptions(rosout=True)
     node = context.new_node("dora_to_ros2", "/openarm", options)
 
     qos_arm = dora.Ros2QosPolicies(reliable=True)
-
     qos_cam = dora.Ros2QosPolicies(reliable=False)
 
     # --- 2. Define Publishers ---
@@ -82,45 +66,68 @@ def main():
         )
     )
 
-    p_cam = node.create_publisher(
-        node.create_topic(
-            "/camera/image/compressed", "sensor_msgs/CompressedImage", qos_cam
+    # Camera publishers
+    # All inputs are JPEG-encoded:
+    #   wrist_{left,right}: ENCODING="jpeg" (opencv-video-capture)
+    #   head_{left,right}:  camera-head-stereo-splitter outputs JPEG at JPEG_QUALITY=90
+    CAMERA_TOPICS = {
+        "camera_wrist_right": "/camera/wrist_right/image_raw/compressed",
+        "camera_wrist_left": "/camera/wrist_left/image_raw/compressed",
+        "camera_head_left": "/camera/head_left/image_raw/compressed",
+        "camera_head_right": "/camera/head_right/image_raw/compressed",
+    }
+    camera_publishers = {
+        eid: node.create_publisher(
+            node.create_topic(topic, "sensor_msgs/CompressedImage", qos_cam)
         )
-    )
+        for eid, topic in CAMERA_TOPICS.items()
+    }
 
-    # --- 3. Pre-defined Constants & Templates (Object Reuse for Speed) ---
-    EMPTY_F64 = pa.scalar([], pa.list_(pa.float64()))
-    SEC_0 = pa.scalar(0, pa.int32())
-    NSEC_0 = pa.scalar(0, pa.uint32())
-    NSEC_WAIT = pa.scalar(0, pa.uint32())
+    # --- 3. Pre-defined Constants ---
+    EMPTY_F64 = np.array([], dtype=np.float64)
+    # JointTrajectory header.stamp = 0 means "execute immediately".
+    # A non-zero stamp is interpreted as a start time and will be rejected
+    # by the controller if it falls in the past.
+    STAMP_ZERO = {"sec": np.int32(0), "nanosec": np.uint32(0)}
 
     NAMES_L_ARM = [f"openarm_left_joint{i + 1}" for i in range(7)]
     NAMES_R_ARM = [f"openarm_right_joint{i + 1}" for i in range(7)]
     NAMES_L_GRP = ["openarm_left_finger_joint1"]
     NAMES_R_GRP = ["openarm_right_finger_joint1"]
 
-    joint_msg = {
-        "header": {"stamp": {"sec": SEC_0, "nanosec": NSEC_0}, "frame_id": ""},
-        "joint_names": None,
-        "points": [
-            {
-                "positions": None,
-                "velocities": EMPTY_F64,
-                "accelerations": EMPTY_F64,
-                "effort": EMPTY_F64,
-                "time_from_start": {"sec": SEC_0, "nanosec": NSEC_WAIT},
-            }
-        ],
-    }
+    # --- 4. Helpers ---
+    def now_stamp() -> dict:
+        """Return the current time as a ROS2 stamp dict for camera messages."""
+        t = time.time()
+        return {"sec": np.int32(int(t)), "nanosec": np.uint32(int((t % 1.0) * 1e9))}
 
-    compressed_img_msg = {
-        "header": {"stamp": {"sec": SEC_0, "nanosec": NSEC_0}, "frame_id": "world"},
-        "format": "jpeg",
-        "data": None,
-    }
+    def make_joint_msg(names: list, positions: list) -> dict:
+        """Build a JointTrajectory message with a single waypoint."""
+        return {
+            "header": {"stamp": STAMP_ZERO, "frame_id": ""},
+            "joint_names": names,
+            "points": [
+                {
+                    "positions": positions,
+                    "velocities": EMPTY_F64,
+                    "accelerations": EMPTY_F64,
+                    "effort": EMPTY_F64,
+                    "time_from_start": {"sec": np.int32(0), "nanosec": np.uint32(0)},
+                }
+            ],
+        }
 
-    # --- 4. Dora Loop ---
+    def make_compressed_img_msg(stamp: dict, img_data: np.ndarray) -> dict:
+        """Build a CompressedImage message from a JPEG-encoded byte array."""
+        return {
+            "header": {"stamp": stamp, "frame_id": "world"},
+            "format": "jpeg",
+            "data": img_data,
+        }
+
+    # --- 5. Dora Loop ---
     dora_node = dora.Node()
+
     for event in dora_node:
         if event["type"] != "INPUT":
             continue
@@ -128,44 +135,38 @@ def main():
         eid = event["id"]
         value = event["value"]
 
-        # --- Case A: Camera Image (JPEG Pass-through) ---
-        if eid == "image":
-            img_data = pa.scalar(value.cast(pa.uint8()), pa.list_(pa.uint8()))
-            compressed_img_msg["data"] = img_data
-            p_cam.publish(pa.array([compressed_img_msg]))
+        # --- Case A: All Cameras (Already JPEG encoded) ---
+        if eid in CAMERA_TOPICS:
+            stamp = now_stamp()
+            msg = make_compressed_img_msg(stamp, value.to_numpy().astype(np.uint8))
+            camera_publishers[eid].publish(pa.array([msg]))
             continue
 
         # --- Case B: Joint Positions ---
-        if eid == "position_left":
-            pub_arm, pub_grp, name_arm, name_grp = (
-                p_l_arm,
-                p_l_grp,
-                NAMES_L_ARM,
-                NAMES_L_GRP,
-            )
-        elif eid == "position_right":
-            pub_arm, pub_grp, name_arm, name_grp = (
-                p_r_arm,
-                p_r_grp,
-                NAMES_R_ARM,
-                NAMES_R_GRP,
-            )
-        else:
-            continue
+        if eid in ("left_position", "right_position"):
+            vals = value.to_numpy().astype(np.float64)
 
-        value_double = value.cast(pa.float64())
-        joint_msg["joint_names"] = name_arm
-        joint_msg["points"][0]["positions"] = pa.scalar(
-            value_double[:7], pa.list_(pa.float64())
-        )
-        pub_arm.publish(pa.array([joint_msg]))
+            if eid == "left_position":
+                pub_arm, pub_grp, name_arm, name_grp = (
+                    p_l_arm,
+                    p_l_grp,
+                    NAMES_L_ARM,
+                    NAMES_L_GRP,
+                )
+            else:  # right_position
+                pub_arm, pub_grp, name_arm, name_grp = (
+                    p_r_arm,
+                    p_r_grp,
+                    NAMES_R_ARM,
+                    NAMES_R_GRP,
+                )
 
-        if len(value_double) >= 8:
-            joint_msg["joint_names"] = name_grp
-            joint_msg["points"][0]["positions"] = pa.scalar(
-                value_double[7:8], pa.list_(pa.float64())
-            )
-            pub_grp.publish(pa.array([joint_msg]))
+            pub_arm.publish(pa.array([make_joint_msg(name_arm, vals[:7].tolist())]))
+
+            if len(vals) >= 8:
+                pub_grp.publish(
+                    pa.array([make_joint_msg(name_grp, vals[7:8].tolist())])
+                )
 
 
 if __name__ == "__main__":
